@@ -1,0 +1,57 @@
+name: Create GitHub Issue from Jira
+
+on:
+  repository_dispatch:
+    types: [jira-in-progress]   # must match what Jira sends
+
+jobs:
+  create-issue:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create GitHub Issue
+        id: create-issue
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}   # built-in, NO PAT
+          script: |
+            const payload = context.payload.client_payload;
+
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: `[${payload.jira_key}] ${payload.jira_summary}`,
+              body: `## Linked Jira Story\n\n` +
+                    `**Key:** [${payload.jira_key}](${payload.jira_url})\n\n` +
+                    `**Description:**\n${payload.jira_description || '_No description_'}\n\n` +
+                    `---\n*Auto-created when story moved to In Progress*`,
+              labels: ['jira-linked']
+            });
+
+            console.log('Issue created:', issue.data.html_url);
+            core.setOutput('issue_url', issue.data.html_url);
+            core.setOutput('issue_number', issue.data.number);
+
+      - name: Post GitHub link back to Jira
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL:    ${{ secrets.JIRA_EMAIL }}
+          JIRA_TOKEN:    ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_KEY:      ${{ github.event.client_payload.jira_key }}
+          ISSUE_URL:     ${{ steps.create-issue.outputs.issue_url }}
+          ISSUE_NUM:     ${{ steps.create-issue.outputs.issue_number }}
+        run: |
+          curl -s -X POST \
+            "$JIRA_BASE_URL/rest/api/3/issue/$JIRA_KEY/remotelink" \
+            -H "Content-Type: application/json" \
+            -u "$JIRA_EMAIL:$JIRA_TOKEN" \
+            -d "{
+              \"object\": {
+                \"url\": \"$ISSUE_URL\",
+                \"title\": \"GitHub Issue #$ISSUE_NUM\",
+                \"icon\": {
+                  \"url16x16\": \"https://github.com/favicon.ico\",
+                  \"title\": \"GitHub\"
+                }
+              }
+            }"
