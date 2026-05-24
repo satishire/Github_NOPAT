@@ -1,0 +1,129 @@
+# .github/workflows/jira-to-github-issue.yml
+
+name: Create GitHub Issue from Jira Transition
+
+on:
+  repository_dispatch:
+    types: [jira-in-progress]   # Custom event triggered by Jira webhook
+
+jobs:
+  create-issue:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write              # Required even when using GitHub App token
+
+    steps:
+      # ── Step 1: Validate the Jira webhook secret ─────────────────────────
+      - name: Validate webhook secret
+        run: |
+          EXPECTED="${{ secrets.JIRA_WEBHOOK_SECRET }}"
+          RECEIVED="${{ github.event.client_payload.secret }}"
+          if [ "$EXPECTED" != "$RECEIVED" ]; then
+            echo "❌ Invalid webhook secret"
+            exit 1
+          fi
+
+      # ── Step 2: Generate a GitHub App installation token (no PAT!) ───────
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          # Scope to this repo only
+          repositories: ${{ github.event.repository.name }}
+
+      # ── Step 3: Extract Jira story details from webhook payload ──────────
+      - name: Parse Jira payload
+        id: jira
+        run: |
+          PAYLOAD='${{ toJson(github.event.client_payload) }}'
+          
+          STORY_KEY=$(echo "$PAYLOAD" | jq -r '.issue.key')
+          STORY_TITLE=$(echo "$PAYLOAD" | jq -r '.issue.fields.summary')
+          STORY_URL=$(echo "$PAYLOAD" | jq -r '.issue.self' \
+            | sed 's|/rest/api/.*||')"/browse/$(echo "$PAYLOAD" | jq -r '.issue.key')"
+          STORY_DESC=$(echo "$PAYLOAD" | jq -r '.issue.fields.description // "No description provided."')
+          ASSIGNEE=$(echo "$PAYLOAD" | jq -r '.issue.fields.assignee.displayName // "Unassigned"')
+          PRIORITY=$(echo "$PAYLOAD" | jq -r '.issue.fields.priority.name // "None"')
+          
+          echo "story_key=$STORY_KEY"         >> $GITHUB_OUTPUT
+          echo "story_title=$STORY_TITLE"     >> $GITHUB_OUTPUT
+          echo "story_url=$STORY_URL"         >> $GITHUB_OUTPUT
+          echo "story_desc=$STORY_DESC"       >> $GITHUB_OUTPUT
+          echo "assignee=$ASSIGNEE"           >> $GITHUB_OUTPUT
+          echo "priority=$PRIORITY"           >> $GITHUB_OUTPUT
+
+      # ── Step 4: Create the GitHub issue using App token ──────────────────
+      - name: Create GitHub issue
+        id: create-issue
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}   # App token, NOT secrets.GITHUB_TOKEN
+          script: |
+            const { data: issue } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: `[${{ steps.jira.outputs.story_key }}] ${{ steps.jira.outputs.story_title }}`,
+              body: `
+            ## 🔗 Jira Story: [${{ steps.jira.outputs.story_key }}](${{ steps.jira.outputs.story_url }})
+
+            ### Description
+            ${{ steps.jira.outputs.story_desc }}
+
+            ---
+            | Field    | Value |
+            |----------|-------|
+            | Assignee | ${{ steps.jira.outputs.assignee }} |
+            | Priority | ${{ steps.jira.outputs.priority }} |
+            | Status   | In Progress |
+
+            > _This issue was automatically created when the Jira story transitioned to **In Progress**._
+            `,
+              labels: ['jira-sync', 'in-progress'],
+            });
+
+            // Store issue number & URL for the next step
+            core.setOutput('issue_number', issue.number);
+            core.setOutput('issue_url',    issue.html_url);
+
+      # ── Step 5: Comment back on Jira story with GitHub issue link ────────
+      #    (Uses the Jira REST API — requires JIRA_API_TOKEN secret)
+      - name: Link GitHub issue back to Jira
+        if: success()
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}        # e.g. https://yourorg.atlassian.net
+          JIRA_EMAIL:    ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          curl --silent --fail --request POST \
+            --url "$JIRA_BASE_URL/rest/api/3/issue/${{ steps.jira.outputs.story_key }}/comment" \
+            --user "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data '{
+              "body": {
+                "type": "doc", "version": 1,
+                "content": [{
+                  "type": "paragraph",
+                  "content": [{
+                    "type": "text",
+                    "text": "✅ GitHub Issue created: ${{ steps.create-issue.outputs.issue_url }}"
+                  }]
+                }]
+              }
+            }'
+
+      # ── Step 6: Retry logic — notify on final failure ────────────────────
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            // Post to a tracking issue or send a Slack alert
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: 1,   // Replace with your ops tracking issue number
+              body: `⚠️ Failed to create issue for Jira story \`${{ steps.jira.outputs.story_key }}\`.\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`
+            });
